@@ -543,7 +543,7 @@ class InputPreprocessor(object):
     raise NotImplementedError('Must be implemented by subclass.')
 
   def create_iterator(self, ds):
-    ds_iterator = ds.make_initializable_iterator()
+    ds_iterator = tf.compat.v1.data.make_initializable_iterator(ds)
     tf.add_to_collection(tf.GraphKeys.TABLE_INITIALIZERS,
                          ds_iterator.initializer)
     return ds_iterator
@@ -971,9 +971,6 @@ class COCOPreprocessor(BaseImagePreprocessor):
       # See https://github.com/tensorflow/models/blob/master/research/object_detection/core/preprocessor.py  # pylint: disable=line-too-long
       mlperf.logger.log(key=mlperf.tags.RANDOM_FLIP_PROBABILITY, value=0.5)
 
-      image = ssd_dataloader.color_jitter(
-          image, brightness=0.125, contrast=0.5, saturation=0.5, hue=0.05)
-      image = ssd_dataloader.normalize_image(image)
       image = tf.cast(image, self.dtype)
 
       encoded_returns = ssd_encoder.encode_labels(boxes, classes)

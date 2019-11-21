@@ -50,7 +50,6 @@ from cnn_util import log_fn
 from models import model_config
 from platforms import util as platforms_util
 from google.protobuf import text_format
-from tensorflow.contrib.compiler import xla
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python import debug as tf_debug
 from tensorflow.python.client import timeline
@@ -274,7 +273,9 @@ flags.DEFINE_enum('data_format', 'NCHW', ('NHWC', 'NCHW'),
                   'native, requires GPU).')
 flags.DEFINE_integer('num_intra_threads', None,
                      'Number of threads to use for intra-op parallelism. If '
-                     'set to 0, the system will pick an appropriate number.')
+                     'set to 0, the system will pick an appropriate number. '
+                     'None is the same as 0 except that it disables intra-op '
+                     'parallelism on a GPU.')
 flags.DEFINE_integer('num_inter_threads', 0,
                      'Number of threads to use for inter-op parallelism. If '
                      'set to 0, the system will pick an appropriate number.')
@@ -362,6 +363,22 @@ flags.DEFINE_float('gpu_memory_frac_for_testing', 0,
 flags.DEFINE_boolean('use_unified_memory', None,
                      'If True, allocate unified memory enabling larger models '
                      'to fit in available device RAM.')
+flags.DEFINE_boolean('timestamped_allocator', False,
+                     'If True marks free BFCAllocator::Chunks with time '
+                     'at which they are freed which can allow more efficient '
+                     'memory allocation in cases like RDMA networking.')
+flags.DEFINE_integer('gpu_kt_max_interval', 0,
+                     'If > 0, the maximum number of GPU Ops that may be queued '
+                     'in a row without also queuing a tracking event.')
+flags.DEFINE_integer('gpu_kt_max_bytes', 0,
+                     'If > 0, the maximum number of bytes '
+                     'of GPU memory that may be allocated by sequential '
+                     'GPU Ops without queuing a tracking event.')
+flags.DEFINE_integer('gpu_kt_max_pending', 0,
+                     'If > 0 no more than this many GPU tracking events may be '
+                     'outstanding at any time.  When this limit is reached '
+                     'launch of additional kernels will stall until an '
+                     'outstanding event completes.')
 flags.DEFINE_boolean('use_tf_layers', True,
                      'If True, use tf.layers for neural network layers. This '
                      'should not affect performance or accuracy in any way.')
@@ -740,36 +757,28 @@ def create_config_proto(params):
   if params.use_unified_memory:
     config.gpu_options.experimental.use_unified_memory = (
         params.use_unified_memory)
+  if params.timestamped_allocator:
+    config.gpu_options.experimental.timestamped_allocator = (
+        params.timestamped_allocator)
+  if params.gpu_kt_max_interval > 0:
+    config.gpu_options.experimental.kernel_tracker_max_interval = (
+        params.gpu_kt_max_interval)
+  if params.gpu_kt_max_bytes > 0:
+    config.gpu_options.experimental.kernel_tracker_max_bytes = (
+        params.gpu_kt_max_bytes)
+  if params.gpu_kt_max_pending > 0:
+    config.gpu_options.experimental.kernel_tracker_max_pending = (
+        params.gpu_kt_max_pending)
   if params.xla:
     config.graph_options.optimizer_options.global_jit_level = (
         tf.OptimizerOptions.ON_1)
-    # TODO(b/117324590): Re-enable PinToHostOptimizer when b/117324590 is fixed.
-    # Currently we have to disable PinToHostOptimizer w/ XLA since it causes
-    # OOM/perf cliffs.
-    config.graph_options.rewrite_options.pin_to_host_optimization = (
-        rewriter_config_pb2.RewriterConfig.OFF)
   if params.rewriter_config:
     rewriter_config = rewriter_config_pb2.RewriterConfig()
     text_format.Merge(params.rewriter_config, rewriter_config)
     config.graph_options.rewrite_options.CopyFrom(rewriter_config)
   elif not params.enable_optimizations:
-    off = rewriter_config_pb2.RewriterConfig.OFF
     config.graph_options.optimizer_options.opt_level = tf.OptimizerOptions.L0
-    rewrite_options = config.graph_options.rewrite_options
-    rewrite_options.layout_optimizer = off
-    rewrite_options.constant_folding = off
-    rewrite_options.shape_optimization = off
-    rewrite_options.remapping = off
-    rewrite_options.arithmetic_optimization = off
-    rewrite_options.dependency_optimization = off
-    rewrite_options.loop_optimization = off
-    rewrite_options.function_optimization = off
-    rewrite_options.debug_stripper = off
-    rewrite_options.disable_model_pruning = True
-    rewrite_options.scoped_allocator_optimization = off
-    rewrite_options.memory_optimization = (
-        rewriter_config_pb2.RewriterConfig.NO_MEM_OPT)
-    rewrite_options.pin_to_host_optimization = off
+    config.graph_options.rewrite_options.disable_meta_optimizer = True
   elif params.variable_update == 'collective_all_reduce':
     rewrite_options = config.graph_options.rewrite_options
     rewrite_options.scoped_allocator_optimization = (
@@ -784,6 +793,11 @@ def create_config_proto(params):
     config.device_filters.append(
         '/job:%s/replica:0/task:%d' % (params.job_name, params.task_index))
 
+  # TODO(b/117324590): Re-enable PinToHostOptimizer when b/117324590 is fixed.
+  # Currently we have to disable PinToHostOptimizer w/ XLA since it causes
+  # OOM/perf cliffs.
+  config.graph_options.rewrite_options.pin_to_host_optimization = (
+      rewriter_config_pb2.RewriterConfig.OFF)
   return config
 
 
@@ -2376,6 +2390,7 @@ class BenchmarkCNN(object):
     mlperf.logger.log(key=mlperf.tags.TRAIN_LOOP)
     skip_final_eval = False
     accuracy_at_1 = None
+    accuracy_at_5 = None
     last_eval_step = local_step
     loop_start_time = time.time()
     last_average_loss = None
@@ -2434,7 +2449,7 @@ class BenchmarkCNN(object):
             value=num_steps_since_last_eval * self.batch_size)
         log_fn('Running evaluation at global_step {}'.format(
             python_global_step))
-        accuracy_at_1, _ = self._eval_once(
+        accuracy_at_1, accuracy_at_5 = self._eval_once(
             sess, summary_writer, eval_graph_info.fetches,
             eval_graph_info.summary_op, eval_image_producer,
             python_global_step)
@@ -2489,7 +2504,7 @@ class BenchmarkCNN(object):
     if eval_graph_info and not skip_final_eval:
       log_fn('Running final evaluation at global_step {}'.format(
           python_global_step))
-      accuracy_at_1, _ = self._eval_once(
+      accuracy_at_1, accuracy_at_5 = self._eval_once(
           sess, summary_writer, eval_graph_info.fetches,
           eval_graph_info.summary_op, eval_image_producer, python_global_step)
     num_epochs_ran = (python_global_step * self.batch_size /
@@ -2522,6 +2537,11 @@ class BenchmarkCNN(object):
     }
     if last_average_loss is not None:
       stats['last_average_loss'] = last_average_loss
+    if accuracy_at_1 is not None:
+      stats['top_1_accuracy'] = accuracy_at_1
+    if accuracy_at_5 is not None:
+      stats['top_5_accuracy'] = accuracy_at_5
+
     success = bool(self.model.reached_target() or
                    (accuracy_at_1 and self.params.stop_at_top_1_accuracy and
                     accuracy_at_1 >= self.params.stop_at_top_1_accuracy))
@@ -3403,8 +3423,8 @@ def _print_os_env_ignored_warning(mkl_flag, flag_default_val, os_env_var):
       (os_env_var, os.environ[os_env_var], flag_default_val, mkl_flag))
 
 
-def _set_environ_vars(params):
-  """Sets up the environment variables that BenchmarkCNN should use."""
+def set_default_param_values_and_env_vars(params):
+  """Sets up the default param values and environment variables ."""
   if params.batchnorm_persistent:
     os.environ['TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT'] = '1'
   else:
@@ -3489,7 +3509,7 @@ def setup(params):
   """
   # Set up environment variables before doing any other global initialization to
   # make sure it uses the appropriate environment variables.
-  params = _set_environ_vars(params)
+  params = set_default_param_values_and_env_vars(params)
 
   # horovod needs to be initialized before create_config_proto() call since
   # it will be used in config generation if enabled.
@@ -3516,6 +3536,6 @@ def setup(params):
 
 def maybe_compile(computation, params):
   if params and params.xla_compile:
-    return xla.compile(computation)
+    return tf.xla.experimental.compile(computation)
   else:
     return computation()
